@@ -2,10 +2,15 @@
 Escape — FastAPI Backend (Azure OpenAI edition)
 ===============================================
 Endpoints:
-  POST /intake       — streams micro_steps via Azure OpenAI SSE
-  POST /stuck        — returns 3 sub-steps for a stuck step
-  GET  /session/{id} — in-memory session history
-  GET  /health       — health check
+  POST /intake                        — streams micro_steps via Azure OpenAI SSE
+  POST /stuck                         — returns 3 sub-steps for a stuck step
+  GET  /session/{id}                  — in-memory session history
+  POST /users                         — create anonymous user (Supabase)
+  GET  /users/{user_id}/sessions      — list user sessions (Supabase)
+  GET  /sessions/{session_id}         — get session by DB id (Supabase)
+  POST /sessions/{session_id}/complete — mark session complete + recalc streak
+  GET  /users/{user_id}/streak        — get streak data
+  GET  /health                        — health check
 
 Run:
   uvicorn main:app --reload --port 8000
@@ -21,6 +26,7 @@ from openai import AsyncAzureOpenAI
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,16 +38,32 @@ from models import (
     StuckResponse,
     SessionResponse,
     SubStep,
+    UserResponse,
+    DbSessionRow,
+    DbSessionSummary,
+    CompleteSessionRequest,
+    CompleteSessionResponse,
+    StreakResponse,
+    UserSessionsResponse,
 )
 from store import session_store
 from prompts import SYSTEM_PROMPT, build_intake_messages, build_stuck_messages
+import database as db
+from database import DatabaseError
 
 # ── App ────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Escape API", version="2.0.0")
 
+# Support comma-separated origins via env var for Render + local dev
+_raw_origins = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173",
+)
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -160,28 +182,107 @@ async def health():
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
-# ── Supabase stubs ─────────────────────────────────────────────────────────
-_SUPABASE_MSG = "Supabase not configured yet."
+# ── Users ──────────────────────────────────────────────────────────────────
 
-@app.post("/users", status_code=503)
+@app.post("/users", response_model=UserResponse, status_code=201)
 async def create_user():
-    raise HTTPException(status_code=503, detail=_SUPABASE_MSG)
+    try:
+        row = await db.create_user()
+        return UserResponse(**row)
+    except DatabaseError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
-@app.get("/users/{user_id}/sessions", status_code=503)
-async def list_user_sessions(user_id: str):
-    raise HTTPException(status_code=503, detail=_SUPABASE_MSG)
 
-@app.get("/sessions/{session_id}", status_code=503)
+# ── Sessions ───────────────────────────────────────────────────────────────
+
+class CreateSessionRequest(BaseModel):
+    user_id: str
+    goal: str
+    steps_json: list[dict]
+    energy_level: int = 5
+    low_power_mode: bool = False
+    five_second_start: str = ""
+
+    model_config = {"arbitrary_types_allowed": True}
+
+
+@app.post("/sessions", response_model=DbSessionRow, status_code=201)
+async def create_session_endpoint(body: CreateSessionRequest):
+    try:
+        row = await db.create_session(
+            user_id=body.user_id,
+            goal=body.goal,
+            steps_json=body.steps_json,
+            energy_level=body.energy_level,
+            low_power_mode=body.low_power_mode,
+            five_second_start=body.five_second_start,
+        )
+        return DbSessionRow(**row)
+    except DatabaseError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/users/{user_id}/sessions", response_model=UserSessionsResponse)
+async def list_user_sessions(user_id: str, completed_only: bool = False, limit: int = 20):
+    try:
+        rows = await db.get_user_sessions(user_id, limit=limit, completed_only=completed_only)
+        return UserSessionsResponse(
+            user_id=user_id,
+            sessions=[DbSessionSummary(**r) for r in rows],
+            total=len(rows),
+        )
+    except DatabaseError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.get("/sessions/{session_id}", response_model=DbSessionRow)
 async def get_session_db(session_id: str):
-    raise HTTPException(status_code=503, detail=_SUPABASE_MSG)
+    try:
+        row = await db.get_session(session_id)
+    except DatabaseError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found")
+    return DbSessionRow(**row)
 
-@app.post("/sessions/{session_id}/complete", status_code=503)
-async def complete_session(session_id: str):
-    raise HTTPException(status_code=503, detail=_SUPABASE_MSG)
 
-@app.get("/users/{user_id}/streak", status_code=503)
+@app.post("/sessions/{session_id}/complete", response_model=CompleteSessionResponse)
+async def complete_session(session_id: str, body: CompleteSessionRequest):
+    try:
+        session_row = await db.complete_session(session_id, stuck_count=body.stuck_count)
+        streak_data = await db.recalculate_streak(body.user_id)
+    except DatabaseError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    return CompleteSessionResponse(
+        session=DbSessionRow(**session_row),
+        streak=StreakResponse(
+            user_id=body.user_id,
+            current_streak=streak_data["current_streak"],
+            longest_streak=streak_data["longest_streak"],
+            last_completed=streak_data.get("last_completed"),
+        ),
+    )
+
+
+# ── Streaks ────────────────────────────────────────────────────────────────
+
+@app.get("/users/{user_id}/streak", response_model=StreakResponse)
 async def get_streak(user_id: str):
-    raise HTTPException(status_code=503, detail=_SUPABASE_MSG)
+    try:
+        row = await db.get_streak(user_id)
+    except DatabaseError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if row is None:
+        # User exists but has no streak yet — return zeroed response
+        return StreakResponse(user_id=user_id, current_streak=0, longest_streak=0)
+    return StreakResponse(
+        user_id=user_id,
+        current_streak=row["current_streak"],
+        longest_streak=row["longest_streak"],
+        last_completed=row.get("last_completed"),
+        updated_at=row.get("updated_at"),
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
