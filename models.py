@@ -118,13 +118,13 @@ class UserResponse(BaseModel):
 # ── Supabase session (DB row shape, distinct from in-memory SessionRecord) ─
 
 class DbSessionRow(BaseModel):
-    """Maps 1:1 to the sessions table row returned by Supabase."""
+    """Maps 1:1 to the sessions table row returned by Supabase or SQLite."""
     id: str
     user_id: str
     goal: str
-    steps_json: list[dict]
-    energy_level: int
-    low_power_mode: bool
+    steps_json: list[dict] = Field(default_factory=list)
+    energy_level: Optional[int] = 5
+    low_power_mode: bool = False
     five_second_start: Optional[str] = None
     stuck_count: int = 0
     created_at: datetime
@@ -135,9 +135,9 @@ class DbSessionSummary(BaseModel):
     """Lightweight row for list endpoints — no steps_json payload."""
     id: str
     goal: str
-    energy_level: int
-    low_power_mode: bool
-    stuck_count: int
+    energy_level: Optional[int] = 5
+    low_power_mode: bool = False
+    stuck_count: int = 0
     created_at: datetime
     completed_at: Optional[datetime] = None
 
