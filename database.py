@@ -379,6 +379,81 @@ async def get_user_sessions(
     return await asyncio.to_thread(_query)
 
 
+async def update_session_steps(session_id: str, steps_json: list[dict]) -> dict:
+    """Update steps_json for an active or completed session."""
+    if _use_supabase():
+        try:
+            sb = _get_client()
+            result = await _run(
+                lambda: sb.table("sessions")
+                    .update({"steps_json": steps_json})
+                    .eq("id", session_id)
+                    .execute()
+            )
+            _check(result, "update_session_steps")
+            if result.data:
+                return result.data[0]
+        except Exception as e:
+            logger.warning(f"Supabase update_session_steps failed, falling back to SQLite: {e}")
+
+    # SQLite fallback
+    def _update():
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE sessions SET steps_json = ? WHERE id = ?",
+                (json.dumps(steps_json), session_id),
+            )
+            conn.commit()
+            cursor.execute(
+                """
+                SELECT id, user_id, goal, steps_json, energy_level,
+                       low_power_mode, five_second_start, stuck_count, created_at, completed_at
+                FROM sessions WHERE id = ?
+                """,
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise DatabaseError(f"Session '{session_id}' not found")
+            return {
+                "id": row[0],
+                "user_id": row[1],
+                "goal": row[2],
+                "steps_json": json.loads(row[3]) if row[3] else [],
+                "energy_level": row[4],
+                "low_power_mode": bool(row[5]),
+                "five_second_start": row[6],
+                "stuck_count": row[7],
+                "created_at": row[8],
+                "completed_at": row[9],
+            }
+    return await asyncio.to_thread(_update)
+
+
+async def delete_session(session_id: str) -> bool:
+    """Delete a session row by id."""
+    if _use_supabase():
+        try:
+            sb = _get_client()
+            result = await _run(
+                lambda: sb.table("sessions").delete().eq("id", session_id).execute()
+            )
+            _check(result, "delete_session")
+            return True
+        except Exception as e:
+            logger.warning(f"Supabase delete_session failed, falling back to SQLite: {e}")
+
+    # SQLite fallback
+    def _delete():
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+    return await asyncio.to_thread(_delete)
+
+
 # ── Streaks ────────────────────────────────────────────────────────────────
 
 async def recalculate_streak(user_id: str) -> dict:

@@ -20,6 +20,7 @@ import asyncio
 import json
 import uuid
 import os
+import re
 from datetime import datetime, timezone
 from typing import AsyncIterator
 
@@ -147,7 +148,10 @@ def _generate_fallback_chat(messages: list[ChatMessage]) -> str:
     last_msg = user_msgs[-1].lower()
 
     # Step generation triggered (after 6 questions or early bypass trigger)
-    if len(user_msgs) >= 7 or "generate" in last_msg or "atomic steps" in last_msg:
+    is_generate_intent = bool(
+        re.search(r"\b(generate (the )?steps|atomic steps|generate now|ready to begin)\b", last_msg)
+    )
+    if len(user_msgs) >= 7 or is_generate_intent:
         raw_goal = user_msgs[0]
         for prefix in ["my goal:", "goal:"]:
             if raw_goal.lower().startswith(prefix):
@@ -466,19 +470,56 @@ async def _call_gemini_native(messages: list[ChatMessage]) -> str:
         raise Exception(f"Gemini API returned status {resp.status_code}: {resp.text[:120]}")
 
 
+async def _call_gemini_stuck(step_id: int, step_text: str) -> list[SubStep]:
+    """Call Google Gemini native generateContent API to get 3 micro-substeps for a stuck step."""
+    user_content = (
+        f"The user is stuck on step {step_id}: \"{step_text}\"\n\n"
+        "Break this into exactly 3 smaller sub-steps. "
+        "Each sub-step must be simpler, shorter, and lower cognitive load than the parent. "
+        "Output only raw JSON with format: {\"substeps\": [{\"id\": 1, \"text\": \"...\", \"duration\": \"< 1 min\"}, {\"id\": 2, \"text\": \"...\", \"duration\": \"< 1 min\"}, {\"id\": 3, \"text\": \"...\", \"duration\": \"2 min\"}]}"
+    )
+    contents = [{"role": "user", "parts": [{"text": user_content}]}]
+
+    model_name = os.environ.get("GEMINI_MODEL", "models/gemini-flash-lite-latest")
+    if not model_name.startswith("models/"):
+        model_name = f"models/{model_name}"
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={_gemini_key}"
+    payload = {
+        "system_instruction": {"parts": [{"text": "You are Escape's AI coach. Break down stuck tasks into 3 microscopic sub-steps. Return ONLY valid JSON with key 'substeps'."}]},
+        "contents": contents,
+        "generationConfig": {
+            "response_mime_type": "application/json"
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=18.0) as http_client:
+        resp = await http_client.post(url, json=payload)
+        if resp.status_code == 200:
+            data = resp.json()
+            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            parsed = _parse_json_from_text(raw_text)
+            substeps_raw = parsed.get("substeps", [])
+            if len(substeps_raw) == 3:
+                return [
+                    SubStep(id=i + 1, text=s["text"], duration=s.get("duration", "< 1 min"))
+                    for i, s in enumerate(substeps_raw)
+                ]
+    return []
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(body: ChatRequest):
+    reply = None
     # 1. Primary: If GEMINI_API_KEY is configured, call native Gemini REST API
     if _gemini_key:
         try:
             reply = await _call_gemini_native(body.messages)
-            if reply and reply.strip():
-                return ChatResponse(reply=reply)
         except Exception as e:
             print("Escape: Gemini native call error or timeout, falling back:", e)
 
     # 2. Secondary: If OpenAI / Azure / Groq client is configured
-    elif client:
+    if (not reply or not reply.strip()) and client:
         try:
             openai_msgs = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}] + [
                 {"role": m.role, "content": m.content} for m in body.messages
@@ -494,9 +535,12 @@ async def chat_endpoint(body: ChatRequest):
             )
             content = response.choices[0].message.content or ""
             if content.strip():
-                return ChatResponse(reply=content)
+                reply = content
         except Exception as e:
             print("Escape: OpenAI/Azure call error, falling back:", e)
+
+    if reply and reply.strip():
+        return ChatResponse(reply=reply)
 
     # 3. Fallback: Return domain-contextualized questions with options
     return ChatResponse(reply=_generate_fallback_chat(body.messages))
@@ -580,19 +624,27 @@ async def intake(request: IntakeRequest):
 # ── /stuck ─────────────────────────────────────────────────────────────────
 @app.post("/stuck", response_model=StuckResponse)
 async def stuck(request: StuckRequest):
-    messages = build_stuck_messages(request)
     substeps = []
 
-    if client:
+    # 1. Primary: Native Gemini if GEMINI_API_KEY is configured
+    if _gemini_key:
         try:
+            substeps = await _call_gemini_stuck(request.step_id, request.step_text)
+        except Exception as e:
+            print("Escape: Gemini stuck call error, falling back:", e)
+
+    # 2. Secondary: Client (OpenAI, Azure, Groq)
+    if not substeps and client:
+        try:
+            messages = build_stuck_messages(request)
             response = await asyncio.wait_for(
                 client.chat.completions.create(
                     model=DEPLOYMENT,
                     messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
                     max_tokens=512,
-                    timeout=5.0,
+                    timeout=15.0,
                 ),
-                timeout=5.0,
+                timeout=15.0,
             )
             raw = response.choices[0].message.content or ""
             data = _parse_json_from_text(raw)
@@ -602,9 +654,10 @@ async def stuck(request: StuckRequest):
                     SubStep(id=i + 1, text=s["text"], duration=s.get("duration", "< 1 min"))
                     for i, s in enumerate(substeps_raw)
                 ]
-        except Exception:
-            substeps = []
+        except Exception as e:
+            print("Escape: Client stuck call error, falling back:", e)
 
+    # 3. Fallback
     if not substeps:
         substeps = [
             SubStep(id=1, text=f"Focus on just the first tiny mechanical part of: {request.step_text[:35]}", duration="< 1 min"),
@@ -702,6 +755,28 @@ async def get_session_db(session_id: str):
     return DbSessionRow(**row)
 
 
+class UpdateSessionStepsRequest(BaseModel):
+    steps_json: list[dict]
+
+
+@app.patch("/sessions/{session_id}/steps", response_model=DbSessionRow)
+async def update_session_steps_endpoint(session_id: str, body: UpdateSessionStepsRequest):
+    try:
+        row = await db.update_session_steps(session_id, body.steps_json)
+        return DbSessionRow(**row)
+    except DatabaseError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session_endpoint(session_id: str):
+    try:
+        deleted = await db.delete_session(session_id)
+        return {"ok": True, "deleted": deleted}
+    except DatabaseError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.post("/sessions/{session_id}/complete", response_model=CompleteSessionResponse)
 async def complete_session(session_id: str, body: CompleteSessionRequest):
     try:
@@ -756,11 +831,18 @@ def _parse_json_from_text(text: str) -> dict:
 
 def _parse_blueprint(raw: str) -> dict:
     data = _parse_json_from_text(raw)
-    required = {"micro_steps", "five_second_start", "energy_level", "low_power_mode"}
+    # Ensure both steps and micro_steps keys exist for interoperability
+    if "steps" in data and "micro_steps" not in data:
+        data["micro_steps"] = data["steps"]
+    elif "micro_steps" in data and "steps" not in data:
+        data["steps"] = data["micro_steps"]
+
+    required = {"five_second_start", "energy_level", "low_power_mode"}
     missing = required - set(data.keys())
-    if missing:
+    if missing or ("steps" not in data and "micro_steps" not in data):
         raise ValueError(f"Blueprint missing fields: {missing}")
-    steps_count = len(data["micro_steps"])
+    steps_list = data.get("steps", data.get("micro_steps", []))
+    steps_count = len(steps_list)
     if not (10 <= steps_count <= 15):
         data["_warning"] = f"Expected 10-15 steps, got {steps_count}"
     return data
